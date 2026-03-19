@@ -1,5 +1,5 @@
 """
-PII MCP Server v1.0.0
+PII MCP Server v1.1.0
 
 Exposes the PII Intelligence API as MCP tools.
 Agents can detect, mask, and audit PII without sending data to an LLM.
@@ -187,6 +187,102 @@ async def scan_and_mask(text: str, strategy: str = "mask") -> str:
         for e in entities:
             lines.append(f"  [{e.get('type', '?')}] \"{e.get('original', e.get('text', ''))}\" → \"{e.get('replacement', '[REDACTED]')}\"")
     return "\n".join(lines)
+
+
+@mcp.tool()
+async def scan_json(
+    data: dict,
+    schema_hints: bool = True,
+    summary_only: bool = False,
+) -> str:
+    """
+    Recursively scan a JSON document for PII in string values AND field names.
+
+    Walks the entire JSON tree (all nested objects, arrays, string values) and
+    returns per-path findings. Ideal for auditing API responses, database exports,
+    log files, or any structured data before storage or transmission.
+
+    New in pii-api v1.6.0:
+    - schema_hints: flag field NAMES that suggest PII (password, ssn, email, credit_card...)
+      even before scanning values — useful for compliance schema auditing
+    - summary_only: fast mode — returns only has_pii + type_summary, no full findings
+
+    Args:
+        data: JSON object or array to scan for PII
+        schema_hints: If True (default), also flag field names that look PII-sensitive
+        summary_only: If True, return summary only (no per-field findings) — faster for large docs
+
+    Returns:
+        Scan results including has_pii, total_pii_found, type_summary,
+        per-path findings, and schema_hints (suspicious field names)
+    """
+    import json as _json
+    result = await _post("/api/json/scan", {
+        "data": data,
+        "schema_hints": schema_hints,
+        "summary_only": summary_only,
+    })
+    lines = [
+        f"PII scan complete: has_pii={result.get('has_pii')}, "
+        f"total={result.get('total_pii_found', 0)}, "
+        f"paths_with_pii={result.get('paths_with_pii', 0)}",
+    ]
+    type_summary = result.get("type_summary", {})
+    if type_summary:
+        lines.append("Types found: " + ", ".join(f"{k}×{v}" for k, v in type_summary.items()))
+    hints = result.get("schema_hints", [])
+    if hints:
+        lines.append(f"\nSchema hints ({len(hints)} suspicious field names):")
+        for h in hints[:10]:  # Show up to 10
+            lines.append(f"  .{h['path']} → likely {h['likely_pii_type']} (matched: '{h['matched_keyword']}')")
+        if len(hints) > 10:
+            lines.append(f"  ... and {len(hints) - 10} more")
+    if not summary_only:
+        findings = result.get("findings", [])
+        if findings:
+            lines.append(f"\nFindings ({len(findings)} paths with PII):")
+            for f in findings[:5]:
+                lines.append(f"  {f['path']}: {f['found']} PII instance(s) — {[m['type'] for m in f['findings']]}")
+            if len(findings) > 5:
+                lines.append(f"  ... and {len(findings) - 5} more")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def redact_json(
+    data: dict,
+    strategy: str = "redact",
+) -> str:
+    """
+    Recursively redact PII from a JSON document, preserving its structure.
+
+    Walks all string values in the JSON tree and replaces PII instances using
+    the chosen strategy. Keys, nesting, and non-string values are unchanged.
+
+    Strategies:
+    - "redact"       → Replace with [PII_TYPE] marker (e.g. [EMAIL], [SSN])
+    - "fake"         → Replace with realistic synthetic data (names, emails, etc.)
+    - "pseudonymize" → Consistent reversible token (same input → same token)
+    - "hash"         → SHA-256 hash of the original value
+    - "partial"      → Keep first chars, mask the rest (e.g. joh***@***.com)
+
+    Args:
+        data: JSON object or array to redact PII from
+        strategy: Masking strategy — one of: redact, fake, pseudonymize, hash, partial
+
+    Returns:
+        The redacted JSON document with the same structure, plus pii_redacted count
+    """
+    import json as _json
+    result = await _post("/api/json/redact", {
+        "data": data,
+        "strategy": strategy,
+    })
+    count = result.get("pii_redacted", 0)
+    redacted = result.get("redacted", data)
+    summary = f"Redacted {count} PII instance(s) using strategy='{strategy}'\n\n"
+    summary += _json.dumps(redacted, indent=2)
+    return summary
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
